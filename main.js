@@ -3,6 +3,12 @@ const NOTION_TOKEN = PropertiesService.getScriptProperties().getProperty('NOTION
 const GEMINI_API_KEY = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
 const NOTION_DATABASE_ID = PropertiesService.getScriptProperties().getProperty('NOTION_DATABASE_ID');
 
+const GEMINI_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent';
+const NOTION_HEADERS = {
+  'Authorization': 'Bearer ' + NOTION_TOKEN,
+  'Notion-Version': '2022-06-28',
+};
+
 // ===== メイン関数（毎週土曜に自動実行） =====
 function weeklyNewsSummary() {
   const today = new Date();
@@ -37,78 +43,27 @@ function fetchEmails(query, since) {
   const emails = [];
 
   threads.forEach(thread => {
-    const messages = thread.getMessages();
-    messages.forEach(message => {
-      if (message.getDate() >= since) {
-        const body = message.getPlainBody();
+    thread.getMessages().forEach(message => {
+      if (message.getDate() < since) return;
 
-        // メール本文からURLを抽出
-        const urlMatch = body.match(/https?:\/\/[^\s\]\)>]+/);
-        const url = urlMatch ? urlMatch[0] : null;
+      const body = message.getPlainBody();
+      const urlMatch = body.match(/https?:\/\/[^\s\]\)>]+/);
 
-        emails.push({
-          subject: message.getSubject(),
-          body: body.slice(0, 1000),
-          url: url,
-        });
-      }
+      emails.push({
+        subject: message.getSubject(),
+        body: body.slice(0, 1000),
+        url: urlMatch ? urlMatch[0] : null,
+      });
     });
   });
 
   return emails;
 }
 
-// ===== Gemini APIで要約 =====
-function summarizeWithGemini(emails, category) {
-  const emailText = emails.map((e, i) =>
-    `【${i + 1}】${e.subject}\n${e.body}`
-  ).join('\n\n---\n\n');
-
-  const prompt = `
-以下は「${category}」に関する1週間分のメール内容です。
-重要なニュースを3〜5点に絞り、日本語で簡潔に要約してください。
-各ニュースは以下の形式で出力してください。
-
-- ニュースの要約文
-
-余計な前置きや後書きは不要です。箇条書きのみ出力してください。
-
-${emailText}
-  `;
-
+// ===== Gemini API呼び出し =====
+function callGemini(prompt) {
   const response = UrlFetchApp.fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${GEMINI_API_KEY}`,
-    {
-      method: 'post',
-      contentType: 'application/json',
-      muteHttpExceptions: true,
-      payload: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }]
-      })
-    }
-  );
-
-  const responseText = response.getContentText();
-  const result = JSON.parse(responseText);
-
-  if (result.error) {
-    throw new Error('Gemini APIエラー：' + result.error.message);
-  }
-
-  return result.candidates[0].content.parts[0].text;
-}
-
-// ===== 要約カラム用にさらに短く圧縮 =====
-function compressSummary(summary) {
-  const prompt = `
-以下の箇条書きを2〜3文の短い文章にまとめてください。
-箇条書きや記号は使わず、自然な日本語の文章にしてください。
-
-${summary}
-  `;
-
-  const response = UrlFetchApp.fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${GEMINI_API_KEY}`,
+    GEMINI_ENDPOINT + '?key=' + GEMINI_API_KEY,
     {
       method: 'post',
       contentType: 'application/json',
@@ -124,122 +79,105 @@ ${summary}
   return result.candidates[0].content.parts[0].text;
 }
 
+// ===== Gemini APIで要約 =====
+function summarizeWithGemini(emails, category) {
+  const emailText = emails.map((e, i) =>
+    `【${i + 1}】${e.subject}\n${e.body}`
+  ).join('\n\n---\n\n');
+
+  return callGemini(`
+以下は「${category}」に関する1週間分のメール内容です。
+重要なニュースを3〜5点に絞り、日本語で簡潔に要約してください。
+各ニュースは以下の形式で出力してください。
+
+- ニュースの要約文
+
+余計な前置きや後書きは不要です。箇条書きのみ出力してください。
+
+${emailText}
+  `);
+}
+
+// ===== 要約カラム用にさらに短く圧縮 =====
+function compressSummary(summary) {
+  return callGemini(`
+以下の箇条書きを2〜3文の短い文章にまとめてください。
+箇条書きや記号は使わず、自然な日本語の文章にしてください。
+
+${summary}
+  `);
+}
+
 // ===== NotionブロックをGemini要約＋リンクから生成 =====
 function buildNotionBlocks(summary, emails) {
   const blocks = [];
 
-  // 要約をNotionの箇条書きブロックに変換
-  const lines = summary.split('\n').filter(line => line.trim() !== '');
-  lines.forEach(line => {
-    const text = line.replace(/^[•\-\*]\s*/, '').trim();
-    if (text) {
-      blocks.push({
-        object: 'block',
-        type: 'bulleted_list_item',
-        bulleted_list_item: {
-          rich_text: [{ type: 'text', text: { content: text } }]
-        }
-      });
-    }
-  });
+  summary.split('\n')
+    .map(line => line.replace(/^[•\-\*]\s*/, '').trim())
+    .filter(text => text)
+    .forEach(text => blocks.push(makeBulletBlock(text)));
 
-  // 区切り線
   blocks.push({ object: 'block', type: 'divider', divider: {} });
 
-  // 元記事リンク一覧
   blocks.push({
     object: 'block',
     type: 'heading_3',
-    heading_3: {
-      rich_text: [{ type: 'text', text: { content: '📎 元記事' } }]
-    }
+    heading_3: { rich_text: [{ type: 'text', text: { content: '📎 元記事' } }] }
   });
 
-  emails.forEach(email => {
-    if (email.url) {
-      blocks.push({
-        object: 'block',
-        type: 'bulleted_list_item',
-        bulleted_list_item: {
-          rich_text: [{
-            type: 'text',
-            text: { content: email.subject, link: { url: email.url } }
-          }]
-        }
-      });
-    } else {
-      blocks.push({
-        object: 'block',
-        type: 'bulleted_list_item',
-        bulleted_list_item: {
-          rich_text: [{ type: 'text', text: { content: email.subject } }]
-        }
-      });
-    }
-  });
+  emails.forEach(email => blocks.push(makeBulletBlock(email.subject, email.url)));
 
   return blocks;
 }
 
+function makeBulletBlock(text, url) {
+  const richText = url
+    ? [{ type: 'text', text: { content: text, link: { url } } }]
+    : [{ type: 'text', text: { content: text } }];
+
+  return {
+    object: 'block',
+    type: 'bulleted_list_item',
+    bulleted_list_item: { rich_text: richText }
+  };
+}
+
 // ===== Notionにページを作成 =====
 function saveToNotion(dateLabel, periodLabel, label, blocks, summary, emailCount) {
-  const url = 'https://api.notion.com/v1/pages';
-
-  const firstBlocks = blocks.slice(0, 100);
-
   const payload = {
     parent: { database_id: NOTION_DATABASE_ID },
     properties: {
-      '名前': {
-        title: [{ text: { content: `週次まとめ ${dateLabel}` } }]
-      },
-      '期間': {
-        rich_text: [{ text: { content: periodLabel } }]
-      },
-      'ラベル': {
-        multi_select: [{ name: label }]
-      },
-      '要約': {
-        rich_text: [{ text: { content: summary } }]
-      },
-      'メール件数': {
-        number: emailCount
-      },
+      '名前':     { title: [{ text: { content: '週次まとめ ' + dateLabel } }] },
+      '期間':     { rich_text: [{ text: { content: periodLabel } }] },
+      'ラベル':   { multi_select: [{ name: label }] },
+      '要約':     { rich_text: [{ text: { content: summary } }] },
+      'メール件数': { number: emailCount },
     },
-    children: firstBlocks
+    children: blocks.slice(0, 100)
   };
 
-  const response = UrlFetchApp.fetch(url, {
+  const response = UrlFetchApp.fetch('https://api.notion.com/v1/pages', {
     method: 'post',
     contentType: 'application/json',
-    headers: {
-      'Authorization': `Bearer ${NOTION_TOKEN}`,
-      'Notion-Version': '2022-06-28',
-    },
+    headers: NOTION_HEADERS,
     payload: JSON.stringify(payload)
   });
 
   const pageId = JSON.parse(response.getContentText()).id;
 
   if (blocks.length > 100) {
-    const remainingBlocks = blocks.slice(100);
-    appendBlocksToPage(pageId, remainingBlocks);
+    appendBlocksToPage(pageId, blocks.slice(100));
   }
 }
 
 // ===== ページにブロックを追加 =====
 function appendBlocksToPage(pageId, blocks) {
-  const chunkSize = 100;
-  for (let i = 0; i < blocks.length; i += chunkSize) {
-    const chunk = blocks.slice(i, i + chunkSize);
-    UrlFetchApp.fetch(`https://api.notion.com/v1/blocks/${pageId}/children`, {
+  for (let i = 0; i < blocks.length; i += 100) {
+    UrlFetchApp.fetch('https://api.notion.com/v1/blocks/' + pageId + '/children', {
       method: 'patch',
       contentType: 'application/json',
-      headers: {
-        'Authorization': `Bearer ${NOTION_TOKEN}`,
-        'Notion-Version': '2022-06-28',
-      },
-      payload: JSON.stringify({ children: chunk })
+      headers: NOTION_HEADERS,
+      payload: JSON.stringify({ children: blocks.slice(i, i + 100) })
     });
     Utilities.sleep(500);
   }
