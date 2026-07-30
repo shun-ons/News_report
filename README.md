@@ -27,7 +27,7 @@ Gmail
 ## 使用技術
 
 - **Google Apps Script**（JavaScript）：自動実行・Gmail操作・API連携
-- **Gemini API**（gemini-2.5-flash-lite）：メール内容の要約生成
+- **Gemini API**（gemini-3.5-flash）：メール内容の要約生成
 - **Notion API**：週次まとめのデータベース保存
 - **Gmail**：Scholar Inbox・Googleアラートのメール収集
 
